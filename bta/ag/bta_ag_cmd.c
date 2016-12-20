@@ -302,8 +302,9 @@ const UINT8 bta_ag_trans_result[] =
     0,                  /* BTA_AG_CALL_CANCEL_RES */
     0,                  /* BTA_AG_END_CALL_RES */
     0,                  /* BTA_AG_IN_CALL_HELD_RES */
+    BTA_AG_RES_UNAT,    /* BTA_AG_UNAT_RES */
+    0,                  /* BTA_AG_MULTI_CALL_RES */
     BTA_AG_RES_BIND,    /* BTA_AG_BIND_RES */
-    BTA_AG_RES_UNAT     /* BTA_AG_UNAT_RES */
 };
 
 /* callsetup indicator value lookup table */
@@ -395,7 +396,7 @@ static void bta_ag_send_result(tBTA_AG_SCB *p_scb, UINT8 code, char *p_arg,
     *p++ = '\n';
 
 #if defined(BTA_AG_RESULT_DEBUG) && (BTA_AG_RESULT_DEBUG == TRUE)
-    APPL_TRACE_DEBUG("bta_ag_send_result: %s", buf);
+    APPL_TRACE_IMP("bta_ag_send_result: %s", buf);
 #endif
 
     /* send to RFCOMM */
@@ -1110,7 +1111,7 @@ void bta_ag_at_hfp_cback(tBTA_AG_SCB *p_scb, UINT16 cmd, UINT8 arg_type,
         return;
     }
 
-    APPL_TRACE_DEBUG("HFP AT cmd:%d arg_type:%d arg:%d arg:%s", cmd, arg_type,
+    APPL_TRACE_IMP("HFP AT cmd:%d arg_type:%d arg:%d arg:%s", cmd, arg_type,
                       int_arg, p_arg);
 
     val.hdr.handle = bta_ag_scb_to_idx(p_scb);
@@ -1118,6 +1119,7 @@ void bta_ag_at_hfp_cback(tBTA_AG_SCB *p_scb, UINT16 cmd, UINT8 arg_type,
     val.hdr.status = BTA_AG_SUCCESS;
     val.num = int_arg;
     bdcpy(val.bd_addr, p_scb->peer_addr);
+    memset(val.str, 0, sizeof(val.str));
     strlcpy(val.str, p_arg, BTA_AG_AT_MAX_LEN);
 
     event = bta_ag_hfp_cb_evt[cmd];
@@ -1543,6 +1545,7 @@ void bta_ag_at_hfp_cback(tBTA_AG_SCB *p_scb, UINT16 cmd, UINT8 arg_type,
 
         case BTA_AG_HF_CMD_BCC:
             bta_ag_send_ok(p_scb);
+            p_scb->codec_updated = TRUE;
             bta_ag_sco_open(p_scb, NULL);
             break;
 #endif
@@ -1721,7 +1724,8 @@ void bta_ag_hsp_result(tBTA_AG_SCB *p_scb, tBTA_AG_API_RESULT *p_result)
 void bta_ag_hfp_result(tBTA_AG_SCB *p_scb, tBTA_AG_API_RESULT *p_result)
 {
     UINT8 code = bta_ag_trans_result[p_result->result];
-    APPL_TRACE_DEBUG("bta_ag_hfp_result : res = %d", p_result->result);
+
+    APPL_TRACE_IMP("bta_ag_hfp_result : res = %d", p_result->result);
 
     switch(p_result->result)
     {
@@ -2098,6 +2102,12 @@ void bta_ag_send_bcs(tBTA_AG_SCB *p_scb, tBTA_AG_DATA *p_data)
 void bta_ag_send_ring(tBTA_AG_SCB *p_scb, tBTA_AG_DATA *p_data)
 {
     UNUSED(p_data);
+
+    if (p_scb->conn_service == BTA_AG_HFP && p_scb->callsetup_ind != BTA_AG_CALLSETUP_INCOMING)
+    {
+        APPL_TRACE_DEBUG("don't send the ring since there is no MT call setup");
+        return;
+    }
 
 #if defined(BTA_AG_MULTI_RESULT_INCLUDED) && (BTA_AG_MULTI_RESULT_INCLUDED == TRUE)
     tBTA_AG_MULTI_RESULT_CB m_res_cb;

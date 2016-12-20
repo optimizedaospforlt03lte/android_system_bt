@@ -122,6 +122,8 @@ enum
     BTA_DM_API_EXECUTE_CBACK_EVT,
     BTA_DM_API_REMOVE_ALL_ACL_EVT,
     BTA_DM_API_REMOVE_DEVICE_EVT,
+    BTA_DM_API_HCI_RAW_COMMAND_EVT,
+    BTA_DM_API_VENDOR_SPECIFIC_COMMAND_EVT,
     BTA_DM_MAX_EVT
 };
 
@@ -166,6 +168,26 @@ typedef struct
     UINT8           pair_mode;
     UINT8           conn_paired_only;
 } tBTA_DM_API_SET_VISIBILITY;
+
+/* data type for BTA_DM_API_HCI_RAW_COMMAND_EVT */
+typedef struct
+{
+    BT_HDR              hdr;
+    UINT16              opcode;
+    UINT8               param_len;
+    UINT8               *p_param_buf;
+    tBTA_RAW_CMPL_CBACK *p_cback;
+} tBTA_DM_API_RAW_COMMAND;
+
+/* data type for BTA_DM_API_VENDOR_SPECIFIC_COMMAND_EVT */
+typedef struct
+{
+    BT_HDR              hdr;
+    UINT16              opcode;
+    UINT8               param_len;
+    UINT8               *p_param_buf;
+    tBTA_VENDOR_CMPL_CBACK *p_cback;
+} tBTA_DM_API_VENDOR_SPECIFIC_COMMAND;
 
 enum
 {
@@ -740,7 +762,8 @@ typedef union
 
     tBTA_DM_API_REMOVE_ACL              remove_acl;
     tBTA_DM_API_REMOVE_ALL_ACL          remove_all_acl;
-
+    tBTA_DM_API_RAW_COMMAND             btc_command;
+    tBTA_DM_API_VENDOR_SPECIFIC_COMMAND vendor_command;
 } tBTA_DM_MSG;
 
 
@@ -885,6 +908,10 @@ typedef struct
     BD_ADDR                     pin_bd_addr;
     DEV_CLASS                   pin_dev_class;
     tBTA_DM_SEC_EVT             pin_evt;
+    tBTA_IO_CAP                 loc_io_caps;    /* IO Capabilities of local device */
+    tBTA_IO_CAP                 rmt_io_caps;    /* IO Capabilities of remote device */
+    tBTA_AUTH_REQ               loc_auth_req;   /* Authentication required for local device */
+    tBTA_AUTH_REQ               rmt_auth_req;
     UINT32          num_val;        /* the numeric value for comparison. If just_works, do not show this number to UI */
     BOOLEAN         just_works;     /* TRUE, if "Just Works" association model */
 #if ( BTA_EIR_CANNED_UUID_LIST != TRUE )
@@ -1175,4 +1202,5 @@ extern void bta_dm_execute_callback(tBTA_DM_MSG *p_data);
 
 
 extern void bta_dm_remove_all_acl(tBTA_DM_MSG *p_data);
+extern void bta_dm_hci_raw_command(tBTA_DM_MSG *p_data);
 #endif /* BTA_DM_INT_H */

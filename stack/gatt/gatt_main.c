@@ -249,6 +249,8 @@ BOOLEAN gatt_disconnect (tGATT_TCB *p_tcb)
                 {
                     gatt_set_ch_state(p_tcb, GATT_CH_CLOSING);
                     ret = L2CA_CancelBleConnectReq (p_tcb->peer_bda);
+                    if (!ret)
+                        gatt_set_ch_state(p_tcb, GATT_CH_CLOSE);
                 }
             }
             else
@@ -398,7 +400,7 @@ BOOLEAN gatt_act_connect (tGATT_REG *p_reg, BD_ADDR bd_addr,
     if (ret)
     {
         if (!opportunistic)
-            gatt_update_app_use_link_flag(p_reg->gatt_if, p_tcb, TRUE, FALSE);
+            gatt_update_app_use_link_flag(p_reg->gatt_if, p_tcb, TRUE, TRUE);
         else
             GATT_TRACE_DEBUG("%s: connection is opportunistic, not updating app usage",
                             __func__);

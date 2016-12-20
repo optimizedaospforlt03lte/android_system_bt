@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <cutils/properties.h>
 
 #include <hardware/bluetooth.h>
 #include <hardware/bt_hf.h>
@@ -39,6 +40,7 @@
 #include "btif_common.h"
 #include "btif_profile_queue.h"
 #include "btif_util.h"
+#include "device/include/controller.h"
 
 /************************************************************************************
 **  Constants & Macros
@@ -99,6 +101,9 @@
 /* Number of BTIF-HF control blocks */
 #define BTIF_HF_NUM_CB       2
 
+/* Assigned number for mSBC codec */
+#define BTA_AG_MSBC_CODEC 5
+
 /* Max HF clients supported from App */
 UINT16 btif_max_hf_clients = 1;
 
@@ -126,6 +131,7 @@ UINT16 bthf_hf_id[BTIF_HF_NUM_CB] = {BTIF_HF_ID_1, BTIF_HF_ID_2,
 ************************************************************************************/
 static bthf_callbacks_t *bt_hf_callbacks = NULL;
 static int hf_idx = BTIF_HF_INVALID_IDX;
+static UINT32 btif_features = BTIF_HF_FEATURES;
 
 #define CHECK_BTHF_INIT() if (bt_hf_callbacks == NULL)\
     {\
@@ -134,7 +140,7 @@ static int hf_idx = BTIF_HF_INVALID_IDX;
     }\
     else\
     {\
-        BTIF_TRACE_EVENT("BTHF: %s", __FUNCTION__);\
+        BTIF_TRACE_IMP("BTHF: %s", __FUNCTION__);\
     }
 
 #define CHECK_BTHF_SLC_CONNECTED() if (bt_hf_callbacks == NULL)\
@@ -180,10 +186,12 @@ static btif_hf_cb_t btif_hf_cb[BTIF_HF_NUM_CB];
 * codec unless this variable is set to TRUE.
 */
 #ifndef BTIF_HF_WBS_PREFERRED
-#define BTIF_HF_WBS_PREFERRED   FALSE
+#define BTIF_HF_WBS_PREFERRED  TRUE
 #endif
 
 BOOLEAN btif_conf_hf_force_wbs = BTIF_HF_WBS_PREFERRED;
+BOOLEAN send_bvra_other_index = FALSE;
+int bvra_other_index_state  = 0;
 
 /************************************************************************************
 **  Functions
@@ -214,6 +222,88 @@ static BOOLEAN is_connected(bt_bdaddr_t *bd_addr)
 
 /*******************************************************************************
 **
+** Function         btif_hf_is_connected_on_other_idx
+**
+** Description      Checks if any other AV SCB is connected
+**
+** Returns          BOOLEAN
+**
+*******************************************************************************/
+
+BOOLEAN btif_hf_is_connected_on_other_idx(int current_index)
+{
+    int i;
+    for (i = 0; i < btif_max_hf_clients; i++)
+    {
+        if (i != current_index)
+        {
+            if ((btif_hf_cb[i].state == BTHF_CONNECTION_STATE_CONNECTED) ||
+                 (btif_hf_cb[i].state == BTHF_CONNECTION_STATE_SLC_CONNECTED))
+                return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/*******************************************************************************
+**
+** Function         btif_hf_get_other_connected_index
+**
+** Description      Checks for other connected index
+**
+** Returns          Other connected index
+**
+*******************************************************************************/
+
+int btif_hf_get_other_connected_index(int current_index)
+{
+    int i;
+    for (i = 0; i < btif_max_hf_clients; i++)
+    {
+        if (i != current_index)
+        {
+            if ((btif_hf_cb[i].state == BTHF_CONNECTION_STATE_CONNECTED) ||
+                 (btif_hf_cb[i].state == BTHF_CONNECTION_STATE_SLC_CONNECTED))
+                return i;
+        }
+    }
+    return btif_max_hf_clients;
+}
+/*******************************************************************************
+**
+** Function         send_bvra_update
+**
+** Description      Internal function to updated other connected HS for BVRA state
+**
+** Returns          void
+**
+*******************************************************************************/
+static void send_bvra_update(int index)
+{
+    BTIF_TRACE_EVENT("connected %d",btif_hf_is_connected_on_other_idx(index));
+    if (btif_hf_is_connected_on_other_idx(index))
+    {
+        int other_idx = btif_hf_get_other_connected_index(index);
+        BTIF_TRACE_EVENT("other_idx %d",other_idx);
+        if (other_idx < btif_max_hf_clients &&
+                (btif_hf_cb[other_idx].peer_feat & BTA_AG_PEER_FEAT_VREC))
+        {
+            tBTA_AG_RES_DATA ag_res;
+            memset(&ag_res, 0, sizeof(ag_res));
+            ag_res.state = bvra_other_index_state;
+            BTIF_TRACE_EVENT("sending on idex %d",other_idx);
+            BTA_AgResult (btif_hf_cb[other_idx].handle,
+                    BTA_AG_BVRA_RES, &ag_res);
+        }
+        else
+        {
+            BTIF_TRACE_EVENT("Invalid connected index");
+        }
+    }
+
+}
+/*******************************************************************************
+**
 ** Function         btif_hf_idx_by_bdaddr
 **
 ** Description      Internal function to get idx by bdaddr
@@ -226,7 +316,7 @@ static int btif_hf_idx_by_bdaddr(bt_bdaddr_t *bd_addr)
         int i;
         for (i = 0; i < btif_max_hf_clients; ++i)
         {
-            if ((bdcmp(bd_addr->address,
+            if (is_connected(bd_addr) && (bdcmp(bd_addr->address,
                                   btif_hf_cb[i].connected_bda.address) == 0))
                 return i;
         }
@@ -394,8 +484,9 @@ static void btif_hf_upstreams_evt(UINT16 event, char* p_param)
     tBTA_AG *p_data = (tBTA_AG *)p_param;
     bdstr_t bdstr;
     int idx = p_data->hdr.handle - 1;
+    BOOLEAN ignore_rfc_fail = false;
 
-    BTIF_TRACE_DEBUG("%s: event=%s", __FUNCTION__, dump_hf_event(event));
+    BTIF_TRACE_IMP("%s: event=%s", __FUNCTION__, dump_hf_event(event));
 
     if ((idx < 0) || (idx >= BTIF_HF_NUM_CB))
     {
@@ -426,6 +517,18 @@ static void btif_hf_upstreams_evt(UINT16 event, char* p_param)
             }
             else if (btif_hf_cb[idx].state == BTHF_CONNECTION_STATE_CONNECTING)
             {
+                /* In Multi-hf, if outgoing RFCOMM connection fails due to collision,
+                 * ignore the failure if HF is already connected.
+                 */
+                if ( (btif_max_hf_clients > 1) &&
+                     (p_data->open.status == BTA_AG_FAIL_RFCOMM) &&
+                     (is_connected(&btif_hf_cb[idx].connected_bda)) )
+                {
+                     BTIF_TRACE_WARNING("%s: Ignoring RFCOMM failure due to collision for dev %s",
+                          __FUNCTION__, bdaddr_to_string(&btif_hf_cb[idx].connected_bda, bdstr, sizeof(bdstr)));
+                     ignore_rfc_fail = true;
+                }
+
                 btif_hf_cb[idx].state = BTHF_CONNECTION_STATE_DISCONNECTED;
             }
             else
@@ -436,14 +539,17 @@ static void btif_hf_upstreams_evt(UINT16 event, char* p_param)
                 break;
             }
 
-            HAL_CBACK(bt_hf_callbacks, connection_state_cb, btif_hf_cb[idx].state,
+            if (ignore_rfc_fail != true)
+            {
+                HAL_CBACK(bt_hf_callbacks, connection_state_cb, btif_hf_cb[idx].state,
                                                         &btif_hf_cb[idx].connected_bda);
+            }
 
             if (btif_hf_cb[idx].state == BTHF_CONNECTION_STATE_DISCONNECTED)
                 bdsetany(btif_hf_cb[idx].connected_bda.address);
 
-            if (p_data->open.status != BTA_AG_SUCCESS)
-                btif_queue_advance();
+            btif_queue_advance();
+
             break;
 
         case BTA_AG_CLOSE_EVT:
@@ -475,7 +581,6 @@ static void btif_hf_upstreams_evt(UINT16 event, char* p_param)
 
             HAL_CBACK(bt_hf_callbacks, connection_state_cb, btif_hf_cb[idx].state,
                              &btif_hf_cb[idx].connected_bda);
-            btif_queue_advance();
             break;
 
         case BTA_AG_AUDIO_OPEN_EVT:
@@ -540,6 +645,9 @@ static void btif_hf_upstreams_evt(UINT16 event, char* p_param)
             HAL_CBACK(bt_hf_callbacks, vr_cmd_cb,
                 (p_data->val.num == 1) ? BTHF_VR_STATE_STARTED :
                       BTHF_VR_STATE_STOPPED, &btif_hf_cb[idx].connected_bda);
+            send_bvra_other_index = TRUE;
+            bvra_other_index_state = p_data->val.num;
+
             break;
 
         case BTA_AG_AT_NREC_EVT:
@@ -814,7 +922,7 @@ static bt_status_t disconnect( bt_bdaddr_t *bd_addr )
         return BT_STATUS_FAIL;
     }
 
-    if (is_connected(bd_addr) && (idx != BTIF_HF_INVALID_IDX))
+    if (idx != BTIF_HF_INVALID_IDX)
     {
         BTA_AgClose(btif_hf_cb[idx].handle);
         return BT_STATUS_SUCCESS;
@@ -848,7 +956,7 @@ static bt_status_t connect_audio( bt_bdaddr_t *bd_addr )
     if (btif_hf_check_if_slc_connected() != BT_STATUS_SUCCESS)
         return BT_STATUS_NOT_READY;
 
-    if (is_connected(bd_addr) && (idx != BTIF_HF_INVALID_IDX))
+    if (idx != BTIF_HF_INVALID_IDX)
     {
         BTA_AgAudioOpen(btif_hf_cb[idx].handle);
 
@@ -882,7 +990,7 @@ static bt_status_t disconnect_audio( bt_bdaddr_t *bd_addr )
         return BT_STATUS_FAIL;
     }
 
-    if (is_connected(bd_addr) && (idx != BTIF_HF_INVALID_IDX))
+    if (idx != BTIF_HF_INVALID_IDX)
     {
         BTA_AgAudioClose(btif_hf_cb[idx].handle);
         return BT_STATUS_SUCCESS;
@@ -903,33 +1011,29 @@ static bt_status_t disconnect_audio( bt_bdaddr_t *bd_addr )
 static bt_status_t start_voice_recognition(bt_bdaddr_t *bd_addr)
 {
     CHECK_BTHF_INIT();
-
-    int idx = btif_hf_idx_by_bdaddr(bd_addr);
-
-    if ((idx < 0) || (idx >= BTIF_HF_NUM_CB))
+    BOOLEAN is_success = FALSE;
+    for (int i = 0; i < btif_max_hf_clients; i++)
     {
-        BTIF_TRACE_ERROR("%s: Invalid index %d", __FUNCTION__, idx);
-        return BT_STATUS_FAIL;
-    }
-
-    if (is_connected(bd_addr) && (idx != BTIF_HF_INVALID_IDX))
-    {
-        if (btif_hf_cb[idx].peer_feat & BTA_AG_PEER_FEAT_VREC)
+        if (((btif_hf_cb[i].state == BTHF_CONNECTION_STATE_CONNECTED) ||
+                (btif_hf_cb[i].state == BTHF_CONNECTION_STATE_SLC_CONNECTED)) &&
+                btif_hf_cb[i].peer_feat & BTA_AG_PEER_FEAT_VREC)
         {
             tBTA_AG_RES_DATA ag_res;
             memset(&ag_res, 0, sizeof(ag_res));
             ag_res.state = 1;
-            BTA_AgResult (btif_hf_cb[idx].handle, BTA_AG_BVRA_RES, &ag_res);
-
-            return BT_STATUS_SUCCESS;
-        }
-        else
-        {
-            return BT_STATUS_UNSUPPORTED;
+            BTA_AgResult (btif_hf_cb[i].handle, BTA_AG_BVRA_RES, &ag_res);
+            is_success = TRUE;
         }
     }
 
-    return BT_STATUS_NOT_READY;
+    if (is_success)
+    {
+        return BT_STATUS_SUCCESS;
+    }
+    else
+    {
+        return BT_STATUS_NOT_READY;
+    }
 }
 
 /*******************************************************************************
@@ -944,33 +1048,29 @@ static bt_status_t start_voice_recognition(bt_bdaddr_t *bd_addr)
 static bt_status_t stop_voice_recognition(bt_bdaddr_t *bd_addr)
 {
     CHECK_BTHF_INIT();
-
-    int idx = btif_hf_idx_by_bdaddr(bd_addr);
-
-    if ((idx < 0) || (idx >= BTIF_HF_NUM_CB))
+    BOOLEAN is_success = FALSE;
+    for (int i = 0; i < btif_max_hf_clients; i++)
     {
-        BTIF_TRACE_ERROR("%s: Invalid index %d", __FUNCTION__, idx);
-        return BT_STATUS_FAIL;
-    }
-
-    if (is_connected(bd_addr) && (idx != BTIF_HF_INVALID_IDX))
-    {
-        if (btif_hf_cb[idx].peer_feat & BTA_AG_PEER_FEAT_VREC)
+        if (((btif_hf_cb[i].state == BTHF_CONNECTION_STATE_CONNECTED) ||
+                (btif_hf_cb[i].state == BTHF_CONNECTION_STATE_SLC_CONNECTED)) &&
+                btif_hf_cb[i].peer_feat & BTA_AG_PEER_FEAT_VREC)
         {
             tBTA_AG_RES_DATA ag_res;
             memset(&ag_res, 0, sizeof(ag_res));
             ag_res.state = 0;
-            BTA_AgResult (btif_hf_cb[idx].handle, BTA_AG_BVRA_RES, &ag_res);
-
-            return BT_STATUS_SUCCESS;
-        }
-        else
-        {
-            return BT_STATUS_UNSUPPORTED;
+            BTA_AgResult (btif_hf_cb[i].handle, BTA_AG_BVRA_RES, &ag_res);
+            is_success = TRUE;
         }
     }
 
-    return BT_STATUS_NOT_READY;
+    if (is_success)
+    {
+        return BT_STATUS_SUCCESS;
+    }
+    else
+    {
+        return BT_STATUS_NOT_READY;
+    }
 }
 
 /*******************************************************************************
@@ -997,7 +1097,7 @@ static bt_status_t volume_control(bthf_volume_type_t type, int volume,
 
     tBTA_AG_RES_DATA ag_res;
     memset(&ag_res, 0, sizeof(tBTA_AG_RES_DATA));
-    if (is_connected(bd_addr) && (idx != BTIF_HF_INVALID_IDX))
+    if (idx != BTIF_HF_INVALID_IDX)
     {
         ag_res.num = volume;
         BTA_AgResult(btif_hf_cb[idx].handle,
@@ -1061,7 +1161,7 @@ static bt_status_t cops_response(const char *cops, bt_bdaddr_t *bd_addr)
         return BT_STATUS_FAIL;
     }
 
-    if (is_connected(bd_addr) && (idx != BTIF_HF_INVALID_IDX))
+    if (idx != BTIF_HF_INVALID_IDX)
     {
         tBTA_AG_RES_DATA    ag_res;
 
@@ -1099,7 +1199,7 @@ static bt_status_t cind_response(int svc, int num_active, int num_held,
         return BT_STATUS_FAIL;
     }
 
-    if (is_connected(bd_addr) && (idx != BTIF_HF_INVALID_IDX))
+    if (idx != BTIF_HF_INVALID_IDX)
     {
         tBTA_AG_RES_DATA    ag_res;
 
@@ -1172,7 +1272,7 @@ static bt_status_t formatted_at_response(const char *rsp, bt_bdaddr_t *bd_addr)
         return BT_STATUS_FAIL;
     }
 
-    if (is_connected(bd_addr) && (idx != BTIF_HF_INVALID_IDX))
+    if (idx != BTIF_HF_INVALID_IDX)
     {
         /* Format the response and send */
         memset (&ag_res, 0, sizeof (ag_res));
@@ -1207,10 +1307,15 @@ static bt_status_t at_response(bthf_at_response_t response_code,
         return BT_STATUS_FAIL;
     }
 
-    if (is_connected(bd_addr) && (idx != BTIF_HF_INVALID_IDX))
+    if (idx != BTIF_HF_INVALID_IDX)
     {
         send_at_result((response_code == BTHF_AT_RESPONSE_OK) ? BTA_AG_OK_DONE
                         : BTA_AG_OK_ERROR, error_code, idx);
+        if (response_code == BTHF_AT_RESPONSE_OK && send_bvra_other_index)
+        {
+            send_bvra_update(idx);
+            send_bvra_other_index = FALSE;
+        }
         return BT_STATUS_SUCCESS;
     }
 
@@ -1243,7 +1348,7 @@ static bt_status_t clcc_response(int index, bthf_call_direction_t dir,
         return BT_STATUS_FAIL;
     }
 
-    if (is_connected(bd_addr) && (idx != BTIF_HF_INVALID_IDX))
+    if (idx != BTIF_HF_INVALID_IDX)
     {
         tBTA_AG_RES_DATA    ag_res;
         int                 xx;
@@ -1305,13 +1410,13 @@ static bt_status_t phone_state_change(int num_active, int num_held, bthf_call_st
     else
         idx = btif_hf_latest_connected_idx();
 
-    BTIF_TRACE_DEBUG("phone_state_change: idx = %d", idx);
+    BTIF_TRACE_IMP("phone_state_change: idx = %d", idx);
 
     /* Check if SLC is connected */
     if (btif_hf_check_if_slc_connected() != BT_STATUS_SUCCESS)
         return BT_STATUS_NOT_READY;
 
-    BTIF_TRACE_DEBUG("phone_state_change: num_active=%d [prev: %d]  num_held=%d[prev: %d]"
+    BTIF_TRACE_IMP("phone_state_change: num_active=%d [prev: %d]  num_held=%d[prev: %d]"
                       " call_setup=%s [prev: %s]", num_active, btif_hf_cb[idx].num_active,
                        num_held, btif_hf_cb[idx].num_held, dump_hf_call_state(call_setup_state),
                        dump_hf_call_state(btif_hf_cb[idx].call_setup_state));
@@ -1353,7 +1458,7 @@ static bt_status_t phone_state_change(int num_active, int num_held, bthf_call_st
     if ( ((num_active + num_held) > 0) && (btif_hf_cb[idx].num_active == 0) && (btif_hf_cb[idx].num_held == 0) &&
          (btif_hf_cb[idx].call_setup_state == BTHF_CALL_STATE_IDLE) )
     {
-        BTIF_TRACE_DEBUG("%s: Active/Held call notification received without call setup update",
+        BTIF_TRACE_IMP("%s: Active/Held call notification received without call setup update",
                           __FUNCTION__);
 
         memset(&ag_res, 0, sizeof(tBTA_AG_RES_DATA));
@@ -1373,7 +1478,7 @@ static bt_status_t phone_state_change(int num_active, int num_held, bthf_call_st
     /* Ringing call changed? */
     if (call_setup_state != btif_hf_cb[idx].call_setup_state)
     {
-        BTIF_TRACE_DEBUG("%s: Call setup states changed. old: %s new: %s",
+        BTIF_TRACE_IMP("%s: Call setup states changed. old: %s new: %s",
             __FUNCTION__, dump_hf_call_state(btif_hf_cb[idx].call_setup_state),
             dump_hf_call_state(call_setup_state));
         memset(&ag_res, 0, sizeof(tBTA_AG_RES_DATA));
@@ -1432,14 +1537,27 @@ static bt_status_t phone_state_change(int num_active, int num_held, bthf_call_st
                 break;
             case BTHF_CALL_STATE_DIALING:
                 if (!(num_active + num_held))
+                {
                     ag_res.audio_handle = btif_hf_cb[idx].handle;
+                }
+                else
+                {
+                    BTIF_TRACE_DEBUG("%s: Already in a call, don't set audio handle", __FUNCTION__);
+                }
                 res = BTA_AG_OUT_CALL_ORIG_RES;
                 break;
             case BTHF_CALL_STATE_ALERTING:
                 /* if we went from idle->alert, force SCO setup here. dialing usually triggers it */
                 if ((btif_hf_cb[idx].call_setup_state == BTHF_CALL_STATE_IDLE) &&
                         !(num_active + num_held))
+                {
                     ag_res.audio_handle = btif_hf_cb[idx].handle;
+                }
+                else
+                {
+                    BTIF_TRACE_DEBUG("%s: Already in a call or prev call state was dialing,"
+                                                           " don't set audio handle", __FUNCTION__);
+                }
                 res = BTA_AG_OUT_CALL_ALERT_RES;
                 break;
             default:
@@ -1447,7 +1565,7 @@ static bt_status_t phone_state_change(int num_active, int num_held, bthf_call_st
                 status = BT_STATUS_PARM_INVALID;
                 break;
         }
-        BTIF_TRACE_DEBUG("%s: Call setup state changed. res=%d, audio_handle=%d", __FUNCTION__, res, ag_res.audio_handle);
+        BTIF_TRACE_IMP("%s: Call setup state changed. res=%d, audio_handle=%d", __FUNCTION__, res, ag_res.audio_handle);
 
         if (res)
             BTA_AgResult(BTA_AG_HANDLE_ALL, res, &ag_res);
@@ -1471,7 +1589,7 @@ static bt_status_t phone_state_change(int num_active, int num_held, bthf_call_st
     if (!activeCallUpdated && ((num_active + num_held) !=
                  (btif_hf_cb[idx].num_active + btif_hf_cb[idx].num_held)) )
     {
-        BTIF_TRACE_DEBUG("%s: Active call states changed. old: %d new: %d", __FUNCTION__, btif_hf_cb[idx].num_active, num_active);
+        BTIF_TRACE_IMP("%s: Active call states changed. old: %d new: %d", __FUNCTION__, btif_hf_cb[idx].num_active, num_active);
         send_indicator_update(BTA_AG_IND_CALL, ((num_active + num_held) > 0) ? 1 : 0);
     }
 
@@ -1479,7 +1597,7 @@ static bt_status_t phone_state_change(int num_active, int num_held, bthf_call_st
     if (num_held != btif_hf_cb[idx].num_held  ||
         ((num_active == 0) && ((num_held + btif_hf_cb[idx].num_held) > 1)))
     {
-        BTIF_TRACE_DEBUG("%s: Held call states changed. old: %d new: %d",
+        BTIF_TRACE_IMP("%s: Held call states changed. old: %d new: %d",
                         __FUNCTION__, btif_hf_cb[idx].num_held, num_held);
         send_indicator_update(BTA_AG_IND_CALLHELD, ((num_held == 0) ? 0 : ((num_active == 0) ? 2 : 1)));
     }
@@ -1490,16 +1608,18 @@ static bt_status_t phone_state_change(int num_active, int num_held, bthf_call_st
          (num_active == btif_hf_cb[idx].num_active) &&
          (num_held == btif_hf_cb[idx].num_held) )
     {
-        BTIF_TRACE_DEBUG("%s: Calls swapped", __FUNCTION__);
+        BTIF_TRACE_IMP("%s: Calls swapped", __FUNCTION__);
         send_indicator_update(BTA_AG_IND_CALLHELD, 1);
     }
 
 update_call_states:
     for (i = 0; i < btif_max_hf_clients; i++)
     {
-        btif_hf_cb[i].num_active = num_active;
-        btif_hf_cb[i].num_held = num_held;
-        btif_hf_cb[i].call_setup_state = call_setup_state;
+        if (btif_hf_cb[i].state == BTHF_CONNECTION_STATE_SLC_CONNECTED) {
+            btif_hf_cb[i].num_active = num_active;
+            btif_hf_cb[i].num_held = num_held;
+            btif_hf_cb[i].call_setup_state = call_setup_state;
+        }
     }
     return status;
 }
@@ -1515,14 +1635,30 @@ update_call_states:
 *******************************************************************************/
 BOOLEAN btif_hf_is_call_idle()
 {
-    if (bt_hf_callbacks == NULL)
-        return TRUE;
+    int i, j = 1;
 
-    for (int i = 0; i < btif_max_hf_clients; ++i)
+    if (bt_hf_callbacks == NULL)
     {
-        if ((btif_hf_cb[i].call_setup_state != BTHF_CALL_STATE_IDLE)
-            || ((btif_hf_cb[i].num_held + btif_hf_cb[i].num_active) > 0))
-            return FALSE;
+        return TRUE;
+    }
+    for (i = 0; i < btif_max_hf_clients; i++)
+    {
+        BTIF_TRACE_EVENT("%s: call_setup_state: %d for handle: %d",
+              __FUNCTION__, btif_hf_cb[i].call_setup_state, btif_hf_cb[i].handle);
+        BTIF_TRACE_EVENT("num_held: %d, num_active: %d for handle: %d",
+                btif_hf_cb[i].num_held, btif_hf_cb[i].num_active, btif_hf_cb[i].handle);
+        j &= ((btif_hf_cb[i].call_setup_state == BTHF_CALL_STATE_IDLE) &&
+                ((btif_hf_cb[i].num_held + btif_hf_cb[i].num_active) == 0));
+    }
+
+    if (j)
+    {
+        BTIF_TRACE_EVENT("%s: call state idle ", __FUNCTION__);
+        return TRUE;
+    }
+    else
+    {
+        return FALSE;
     }
 
     return TRUE;
@@ -1565,13 +1701,13 @@ BOOLEAN btif_hf_call_terminated_recently()
 *******************************************************************************/
 static void  cleanup( void )
 {
-    BTIF_TRACE_EVENT("%s", __FUNCTION__);
+    BTIF_TRACE_IMP("%s", __FUNCTION__);
 
-    if (bt_hf_callbacks)
-    {
-        btif_disable_service(BTA_HFP_SERVICE_ID);
-        bt_hf_callbacks = NULL;
-    }
+#if (defined(BTIF_HF_SERVICES) && (BTIF_HF_SERVICES & BTA_HFP_SERVICE_MASK))
+    btif_disable_service(BTA_HFP_SERVICE_ID);
+#else
+    btif_disable_service(BTA_HSP_SERVICE_ID);
+#endif
 }
 
 /*******************************************************************************
@@ -1608,6 +1744,69 @@ static bt_status_t  configure_wbs( bt_bdaddr_t *bd_addr , bthf_wbs_config_t conf
     return BT_STATUS_SUCCESS;
 }
 
+static void set_voip_network_type_wifi_hci_cmd_complete(tBTM_VSC_CMPL* p_data)
+{
+    UINT8         *stream,  status, subcmd;
+    UINT16        opcode, length;
+
+    if (p_data && (stream = (UINT8*)p_data->p_param_buf))
+    {
+        opcode = p_data->opcode;
+        length = p_data->param_len;
+        STREAM_TO_UINT8(status, stream);
+        STREAM_TO_UINT8(subcmd, stream);
+        BTIF_TRACE_DEBUG("%s opcode = 0x%04X, length = %d, status = %d, subcmd = %d",
+                __FUNCTION__, opcode, length, status, subcmd);
+        if (status == HCI_SUCCESS)
+        {
+            BTIF_TRACE_DEBUG("btm_SetVoipNetworkTypeWifi status success");
+        }
+    }
+}
+
+/*******************************************************************************
+**
+** Function         voip_network_type_wifi
+**
+** Description      BT app updates the connectivity network used for VOIP as Wifi
+**
+** Returns          bt_status_t
+**
+*******************************************************************************/
+static bt_status_t voip_network_type_wifi(bthf_voip_state_t isVoipStarted,
+                                          bthf_voip_call_network_type_t isNetworkWifi)
+{
+    UINT8           cmd[3], *p_cursor;
+    UINT8           sub_cmd = HCI_VSC_SUBCODE_VOIP_NETWORK_WIFI;
+    tBTM_STATUS     status = BTM_NO_RESOURCES;
+    int             idx = btif_hf_latest_connected_idx();
+
+    CHECK_BTHF_INIT();
+
+    if ((idx < 0) || (idx >= BTIF_HF_NUM_CB))
+    {
+        BTIF_TRACE_ERROR("%s: Invalid index %d", __FUNCTION__, idx);
+        return BT_STATUS_FAIL;
+    }
+
+    p_cursor = cmd;
+    memset(cmd, 0, 3);
+
+    *p_cursor++ = sub_cmd;
+    *p_cursor++ = isVoipStarted;
+    *p_cursor++ = isNetworkWifi;
+
+    if ((status = BTM_VendorSpecificCommand(HCI_VSC_VOIP_NETWORK_WIFI_OCF, sizeof(cmd),
+            cmd, set_voip_network_type_wifi_hci_cmd_complete)) != BTM_CMD_STARTED)
+    {
+        BTIF_TRACE_ERROR("%s: status %d", __FUNCTION__, status);
+        return BT_STATUS_FAIL;
+    }
+
+    return BT_STATUS_SUCCESS;
+
+}
+
 static const bthf_interface_t bthfInterface = {
     sizeof(bthfInterface),
     init,
@@ -1627,6 +1826,7 @@ static const bthf_interface_t bthfInterface = {
     phone_state_change,
     cleanup,
     configure_wbs,
+    voip_network_type_wifi,
     bind_response,
 };
 
@@ -1641,28 +1841,60 @@ static const bthf_interface_t bthfInterface = {
 *******************************************************************************/
 bt_status_t btif_hf_execute_service(BOOLEAN b_enable)
 {
-     char * p_service_names[] = BTIF_HF_SERVICE_NAMES;
-     int i;
-     if (b_enable)
-     {
-          /* Enable and register with BTA-AG */
-          BTA_AgEnable (BTA_AG_PARSE, bte_hf_evt);
-              for (i = 0; i < btif_max_hf_clients; i++)
-              {
-                  BTA_AgRegister(BTIF_HF_SERVICES, BTIF_HF_SECURITY,
-                      BTIF_HF_FEATURES, p_service_names, bthf_hf_id[i]);
-              }
-     }
-     else {
-         /* De-register AG */
-         for (i = 0; i < btif_max_hf_clients; i++)
-         {
-             BTA_AgDeregister(btif_hf_cb[i].handle);
-         }
-         /* Disable AG */
-         BTA_AgDisable();
-     }
-     return BT_STATUS_SUCCESS;
+    char * p_service_names[] = BTIF_HF_SERVICE_NAMES;
+    int i;
+    uint8_t no_of_codecs = 0;
+    uint8_t* codecs;
+    char value[PROPERTY_VALUE_MAX];
+
+    BTIF_TRACE_IMP("%s: enable: %d", __FUNCTION__, b_enable);
+
+    if (b_enable)
+    {
+        /* Enable and register with BTA-AG */
+        BTA_AgEnable (BTA_AG_PARSE, bte_hf_evt);
+        codecs = controller_get_interface()->get_local_supported_codecs(&no_of_codecs);
+        if (codecs != NULL)
+        {
+            for (i = 0; i < no_of_codecs; i++)
+            {
+                if (codecs[i] == BTA_AG_MSBC_CODEC)
+                {
+                    btif_features |= BTA_AG_FEAT_CODEC;
+                    break;
+                }
+            }
+        }
+        else
+        {
+            /* Read the property if local supported codecs commands is not supported */
+            if (property_get("ro.bluetooth.hfp.ver", value, "1.5") &&
+                     (!strcmp(value, "1.6") || !strcmp(value, "1.7")) )
+               btif_features |= BTA_AG_FEAT_CODEC;
+        }
+
+        for (i = 0; i < btif_max_hf_clients; i++)
+        {
+            BTA_AgRegister(BTIF_HF_SERVICES, BTIF_HF_SECURITY,
+                btif_features, p_service_names, bthf_hf_id[i]);
+        }
+    }
+    else {
+        if (bt_hf_callbacks)
+        {
+            BTIF_TRACE_IMP("%s: setting call backs to NULL", __FUNCTION__);
+            bt_hf_callbacks = NULL;
+        }
+        /* De-register AG */
+        for (i = 0; i < btif_max_hf_clients; i++)
+        {
+            BTA_AgDeregister(btif_hf_cb[i].handle);
+        }
+        /* Disable AG */
+        BTA_AgDisable();
+    }
+    BTIF_TRACE_IMP("%s: enable: %d completed", __FUNCTION__, b_enable);
+    return BT_STATUS_SUCCESS;
 }
 
 /*******************************************************************************

@@ -31,6 +31,7 @@
 #include "btm_int.h"
 #include "hcimsgs.h"
 #include "device/include/controller.h"
+#include "device/include/interop.h"
 #include "stack_config.h"
 
 #if (BLE_INCLUDED == TRUE)
@@ -57,17 +58,17 @@ BOOLEAN L2CA_CancelBleConnectReq (BD_ADDR rem_bda)
     /* There can be only one BLE connection request outstanding at a time */
     if (btm_ble_get_conn_st() == BLE_CONN_IDLE)
     {
-        L2CAP_TRACE_WARNING ("L2CA_CancelBleConnectReq - no connection pending");
+        L2CAP_TRACE_WARNING ("%s - no connection pending", __func__);
         return(FALSE);
     }
 
     if (memcmp (rem_bda, l2cb.ble_connecting_bda, BD_ADDR_LEN))
     {
-        L2CAP_TRACE_WARNING ("L2CA_CancelBleConnectReq - different  BDA Connecting: %08x%04x  Cancel: %08x%04x",
+        L2CAP_TRACE_WARNING ("%s - different  BDA Connecting: %08x%04x  Cancel: %08x%04x", __func__,
                               (l2cb.ble_connecting_bda[0]<<24)+(l2cb.ble_connecting_bda[1]<<16)+(l2cb.ble_connecting_bda[2]<<8)+l2cb.ble_connecting_bda[3],
                               (l2cb.ble_connecting_bda[4]<<8)+l2cb.ble_connecting_bda[5],
                               (rem_bda[0]<<24)+(rem_bda[1]<<16)+(rem_bda[2]<<8)+rem_bda[3], (rem_bda[4]<<8)+rem_bda[5]);
-
+        btm_ble_dequeue_direct_conn_req(rem_bda);
         return(FALSE);
     }
 
@@ -283,6 +284,7 @@ void l2cble_notify_le_connection (BD_ADDR bda)
     tL2C_LCB *p_lcb = l2cu_find_lcb_by_bd_addr (bda, BT_TRANSPORT_LE);
     tACL_CONN *p_acl = btm_bda_to_acl(bda, BT_TRANSPORT_LE) ;
     tL2C_CCB *p_ccb;
+    BD_NAME bdname;
 
     if (p_lcb != NULL && p_acl != NULL && p_lcb->link_state != LST_CONNECTED)
     {
@@ -302,7 +304,11 @@ void l2cble_notify_le_connection (BD_ADDR bda)
         }
     }
 
-    l2cble_use_preferred_conn_params(bda);
+    if (!BTM_GetRemoteDeviceName(bda, bdname) || !*bdname ||
+        (!interop_match_name(INTEROP_DISABLE_LE_CONN_PREFERRED_PARAMS, (const char*) bdname)))
+    {
+        l2cble_use_preferred_conn_params(bda);
+    }
 }
 
 /*******************************************************************************
